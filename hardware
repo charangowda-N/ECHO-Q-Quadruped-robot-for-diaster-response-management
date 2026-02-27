@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+
+"""
+Hardware Interface for Dingo Quadruped
+Handles:
+- I2C initialization
+- Servo configuration
+- Angle mapping (logical → physical)
+- Motor relaxation
+"""
+
+import sys
+import math as m
+import numpy as np
+import rospy
+from adafruit_servokit import ServoKit
+
+
+class HardwareInterface:
+    """
+    Hardware abstraction layer for servo-based quadruped.
+    """
+
+    # ==============================
+    # -------- CONSTANTS ----------
+    # ==============================
+    PWM_MIN = 370
+    PWM_MAX = 2400
+    SERVO_CHANNELS = 16
+    I2C_ADDRESS = 0x40
+
+    def __init__(self, link):
+        self.link = link
+        self.servo_angles = np.zeros((3, 4))
+
+        self._initialize_hardware()
+        self._load_calibration()
+        self._configure_servos()
+
+    # ==========================================================
+    #                   INITIALIZATION BLOCK
+    # ==========================================================
+
+    def _initialize_hardware(self):
+        """Initialize I2C ServoKit."""
+        try:
+            self.kit = ServoKit(
+                channels=self.SERVO_CHANNELS,
+                address=self.I2C_ADDRESS
+            )
+        except (OSError, ValueError):
+            rospy.logfatal("Failed to initialize ServoKit. Check I2C connection.")
+            sys.exit(1)
+
+    def _load_calibration(self):
+        """Load servo calibration offsets, pin mapping and inversion mask."""
+
+        # Physical calibration offsets (degrees)
+        self.physical_offsets = np.array([
+            [15, 95, 95, 3],       # Hips
+            [60, 1, 60, 8],        # Thighs
+            [120, 100, 160, 80]    # Calves
+        ])
+
+        # Servo pin mapping
+        self.pins = np.array([
+            [14, 10, 2, 6],
+            [15, 9, 1, 5],
+            [12, 8, 0, 4]
+        ])
+
+        # Inversion mask
+        self.inversion_mask = np.array([
+            [1, 0, 0, 1],  # Hips
+            [0, 1, 0, 1],  # Thighs
+            [0, 1, 0, 1]   # Calves
+        ])
+
+    def _configure_servos(self):
+        """Configure PWM range and actuation range."""
+        for i in range(self.SERVO_CHANNELS):
+            try:
+                servo = self.kit.servo[i]
+                servo.actuation_range = 180
+                servo.set_pulse_width_range(self.PWM_MIN, self.PWM_MAX)
+            except Exception:
+                pass
+
+    # ==========================================================
+    #                   CORE CONTROL METHODS
+    # ==========================================================
+
+    def set_actuator_positions(self, joint_angles):
+        """
+        Convert joint angles (radians) to servo commands.
+        joint_angles: 3x4 matrix (axis x leg)
+        """
+
+        for leg in range(4):
+            for axis in range(3):
+
+                theta_deg = m.degrees(joint_angles[axis, leg])
+
+                # Apply inversion if needed
+                if self.inversion_mask[axis, leg]:
+                    command_angle = 180 - theta_deg
+                else:
+                    command_angle = theta_deg
+
+                # Apply physical offset
+                final_angle = self.physical_offsets[axis, leg] + command_angle
+
+                # Clamp to valid range
+                final_angle = max(0, min(180, final_angle))
+
+                # Send to hardware
+                try:
+                    self.kit.servo[self.pins[axis, leg]].angle = final_angle
+                except Exception:
+                    pass
+
+    # ==========================================================
+    #                   SAFETY / UTILITIES
+    # ==========================================================
+
+    def relax_all_motors(self, servo_mask=np.ones((3, 4))):
+        """
+        Disable torque on selected motors.
+        servo_mask: 3x4 matrix (1 = relax, 0 = keep active)
+        """
+
+        for leg in range(4):
+            for axis in range(3):
+                if servo_mask[axis, leg] == 1:
+                    try:
+                        self.kit.servo[self.pins[axis, leg]].angle = None
+                    except Exception:
+                        pass
